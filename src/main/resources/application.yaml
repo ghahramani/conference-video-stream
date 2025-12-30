@@ -1,9 +1,0 @@
-spring:
-  application:
-    name: streaming
-  http:
-    codecs:
-      max-in-memory-size: 10MB
-
-server:
-  max-http-request-header-size: 32KB

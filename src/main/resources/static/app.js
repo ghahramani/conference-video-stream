@@ -5,7 +5,7 @@ const CONFIG = {
     // 250ms is the "Sweet Spot" for mobile stability
     chunkInterval: 250,
     // 20s tolerance for bad mobile networks before removing a user
-    watchdogTimeout: 20000,
+    watchdogTimeout: 10000,
     // Preferred Codec (Standard WebRTC profile)
     codec: 'video/webm; codecs="vp8, opus"'
 };

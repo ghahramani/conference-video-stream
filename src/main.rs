@@ -15,10 +15,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-// Import for logging
 
 // ==========================================
-// 1. STATE MANAGEMENT
+// 1. STATE
 // ==========================================
 
 struct Room {
@@ -40,18 +39,15 @@ struct VideoFrame {
 }
 
 // ==========================================
-// 2. MAIN SERVER
+// 2. MAIN
 // ==========================================
 
 #[tokio::main]
 async fn main() {
-    // ---------------------------------------------------------
-    // 1. ENABLE LOGGING (Explicitly set to INFO)
-    // ---------------------------------------------------------
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()), // Force INFO level
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -74,12 +70,12 @@ async fn main() {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    tracing::info!("🚀 Rust Server listening on 0.0.0.0:8080"); // You should see this now!
+    tracing::info!("🚀 Rust Server listening on 0.0.0.0:8080");
     axum::serve(listener, app).await.unwrap();
 }
 
 // ==========================================
-// 3. PRESENTER
+// 3. PRESENTER (HEADER FIX)
 // ==========================================
 
 async fn ws_publish_handler(
@@ -114,43 +110,93 @@ async fn handle_publisher(
         room_entry.tx.clone()
     };
 
+    // BUFFER for split headers (e.g., 1 byte + Rest)
+    let mut header_accumulator: Vec<u8> = Vec::new();
+
     while let Some(Ok(msg)) = socket.recv().await {
         if let Message::Binary(data) = msg {
+            // Heartbeat
             if let Some(mut room) = state.rooms.get_mut(&stream_id) {
                 room.last_heartbeat = Instant::now();
             }
 
-            let b64_data = general_purpose::STANDARD.encode(&data);
-            let data_len = data.len();
-
-            let frame = VideoFrame {
-                p_id: user_id.clone(),
-                data_base64: b64_data,
-            };
-
-            // =========================================================
-            // FIX: STRICT HEADER LOCKING
-            // =========================================================
-            if let Some(mut room) = state.rooms.get_mut(&stream_id) {
-                // Check if the room currently has NO header
-                let needs_header = room.last_frame.p_id.is_empty();
-
-                // We ONLY save if we need a header AND this packet is big enough (>100 bytes)
-                // We REMOVED the "|| is_owner" check. The owner is NOT allowed to overwrite
-                // the header with subsequent video frames.
-                if needs_header && data_len > 100 {
-                    tracing::info!("💾 LOCKING Header ({} bytes) for {}", data_len, stream_id);
-                    room.last_frame = Arc::new(frame.clone());
-                }
+            if data.is_empty() {
+                continue;
             }
 
-            let _ = tx.send(frame);
+            // 1. Check if the room ALREADY has a header locked
+            let has_header = if let Some(room) = state.rooms.get(&stream_id) {
+                !room.last_frame.p_id.is_empty()
+            } else {
+                false
+            };
+
+            if has_header {
+                // ==============================
+                // FAST PATH (Video Flowing)
+                // ==============================
+                let b64 = general_purpose::STANDARD.encode(&data);
+                let frame = VideoFrame {
+                    p_id: user_id.clone(),
+                    data_base64: b64,
+                };
+                let _ = tx.send(frame);
+            } else {
+                // ==============================
+                // BUFFERING PATH (Header Hunt)
+                // ==============================
+                header_accumulator.extend(data);
+
+                // Wait until we have at least 50 bytes to ensure we caught the split
+                if header_accumulator.len() >= 50 {
+                    let b64 = general_purpose::STANDARD.encode(&header_accumulator);
+                    let frame = VideoFrame {
+                        p_id: user_id.clone(),
+                        data_base64: b64,
+                    };
+
+                    // SAVE IT
+                    if let Some(mut room) = state.rooms.get_mut(&stream_id) {
+                        if room.last_frame.p_id.is_empty() {
+                            let magic = if header_accumulator.len() >= 4 {
+                                format!(
+                                    "{:02X} {:02X} {:02X} {:02X}",
+                                    header_accumulator[0],
+                                    header_accumulator[1],
+                                    header_accumulator[2],
+                                    header_accumulator[3]
+                                )
+                            } else {
+                                "??".to_string()
+                            };
+
+                            tracing::info!(
+                                "💾 REASSEMBLED Header ({} bytes) | Magic: [ {} ]",
+                                header_accumulator.len(),
+                                magic
+                            );
+                            room.last_frame = Arc::new(frame.clone());
+                        }
+                    }
+
+                    // SEND IT
+                    let _ = tx.send(frame);
+
+                    // Clear buffer to stop accumulating (next loop goes to Fast Path)
+                    header_accumulator.clear();
+                } else {
+                    tracing::warn!(
+                        "⏳ Buffering split header... ({} bytes)",
+                        header_accumulator.len()
+                    );
+                }
+            }
         } else if let Message::Close(_) = msg {
             break;
         }
     }
 
-    // Cleanup: Clear header when I leave, so the next person can set a NEW header
+    // Cleanup
     if let Some(mut room) = state.rooms.get_mut(&stream_id) {
         if room.last_frame.p_id == user_id {
             tracing::info!("🗑️ Unlocking Header for {}", stream_id);
@@ -163,6 +209,7 @@ async fn handle_publisher(
 
     tracing::info!("❌ Presenter left: {}", user_id);
 }
+
 // ==========================================
 // 4. WATCHER
 // ==========================================
@@ -212,10 +259,10 @@ async fn watch_handler(
 
 async fn cleanup_loop(state: Arc<AppState>) {
     loop {
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         let now = Instant::now();
         state.rooms.retain(|id, room| {
-            let active = now.duration_since(room.last_heartbeat) < Duration::from_secs(30);
+            let active = now.duration_since(room.last_heartbeat) < Duration::from_secs(5);
             if !active {
                 tracing::info!("🗑️ Garbage Collecting Room: {}", id);
             }

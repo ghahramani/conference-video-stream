@@ -91,7 +91,9 @@ async function startPublishing() {
         localVideo.muted = true;
 
         // WebSocket Setup
-        const wsUrl = `ws://localhost:8080/publish/${streamId}/${myPId}/HIGH`;
+        const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        const host = window.location.host;
+        const wsUrl = `${protocol}://${host}/publish/${streamId}/${myPId}/HIGH`;
         const socket = new WebSocket(wsUrl);
         socket.binaryType = "arraybuffer";
 

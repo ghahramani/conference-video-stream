@@ -1,7 +1,13 @@
+// ==========================================
+// 1. GLOBAL CONFIG & STATE
+// ==========================================
 const CONFIG = {
-    chunkInterval: 250,      // 250ms: Balance between low latency and stability
-    watchdogTimeout: 10000,  // 20s: Tolerance for network lag
-    codec: 'video/webm; codecs="vp8, opus"' // VP8 + Opus Audio
+    // 250ms is the "Sweet Spot" for mobile stability
+    chunkInterval: 250,
+    // 20s tolerance for bad mobile networks before removing a user
+    watchdogTimeout: 20000,
+    // Preferred Codec (Standard WebRTC profile)
+    codec: 'video/webm; codecs="vp8, opus"'
 };
 
 let streamId = "";
@@ -9,55 +15,94 @@ let myPId = "user-" + Math.floor(Math.random() * 100000);
 let isPresenter = false;
 let isWatching = false;
 
-// State
+// UI & Logic State
 const activePresenters = new Set();
 const lastPacketTime = {};
-const mediaBuffers = {};
-const mediaSources = {};
-const mediaQueues = {};
+const stuckMonitors = {}; // Tracks if video is frozen
+
+// Media Processing State
+const mediaBuffers = {};   // pId -> SourceBuffer
+const mediaSources = {};   // pId -> MediaSource
+const mediaQueues = {};    // pId -> Array<Uint8Array>
 const mediaSourceReady = {};
 
-// Auto cleanup
+// ==========================================
+// 2. HEALTH MONITORS (The Fixes)
+// ==========================================
+
+// A. WATCHDOG: Removes users who truly disconnected
 setInterval(() => {
     const now = Date.now();
     activePresenters.forEach(pId => {
         if (pId === myPId) return;
 
         const lastSeen = lastPacketTime[pId] || 0;
-        const diff = now - lastSeen;
-
-        // Log if we are getting close to timeout
-        if (diff > 5000 && diff < CONFIG.watchdogTimeout) {
-            console.warn(`User ${pId} lagging... last packet ${diff}ms ago`);
-        }
-
-        if (diff > CONFIG.watchdogTimeout) {
-            console.error(`User ${pId} TIMED OUT. Removing.`);
+        if (now - lastSeen > CONFIG.watchdogTimeout) {
+            console.error(`❌ User ${pId} TIMED OUT. Removing.`);
             removePresenter(pId);
         }
     });
 }, 2000);
 
+// B. VIDEO CPR: Detects if video is stuck and jumpstarts it
+// This fixes the "Frozen Image" issue on Watchers
+setInterval(() => {
+    activePresenters.forEach(pId => {
+        const video = document.getElementById(`video-${pId}`);
+        const sb = mediaBuffers[pId];
+
+        if (!video || !sb || video.paused || sb.buffered.length === 0) return;
+
+        if (!stuckMonitors[pId]) stuckMonitors[pId] = { lastTime: 0, stuckCount: 0 };
+        const monitor = stuckMonitors[pId];
+
+        // Check if playback time has moved since last second
+        if (Math.abs(video.currentTime - monitor.lastTime) < 0.1) {
+            monitor.stuckCount++;
+        } else {
+            monitor.stuckCount = 0;
+            monitor.lastTime = video.currentTime;
+        }
+
+        // If stuck for > 3 seconds, NUDGE the player
+        if (monitor.stuckCount > 3) {
+            console.warn(`⚠️ Video ${pId} frozen! Jumpstarting...`);
+            const end = sb.buffered.end(sb.buffered.length - 1);
+
+            // If we are way behind live edge, jump to edge
+            if (end - video.currentTime > 2) {
+                video.currentTime = end - 0.1;
+            } else {
+                video.currentTime += 0.1; // Tiny nudge
+            }
+            // Reset counter logic to prevent infinite jumping
+            if (monitor.stuckCount > 10) monitor.stuckCount = 0;
+        }
+    });
+}, 1000);
+
 function removePresenter(pId) {
     if (!activePresenters.has(pId)) return;
     activePresenters.delete(pId);
 
-    // Cleanup DOM
     const videoEl = document.getElementById(`video-${pId}`);
     if (videoEl) videoEl.closest('.video-card')?.remove();
 
-    // Cleanup Memory
     delete mediaBuffers[pId];
     delete mediaQueues[pId];
     delete mediaSources[pId];
     delete lastPacketTime[pId];
+    delete stuckMonitors[pId];
 
     updateGridLayout();
 }
 
+// ==========================================
+// 3. LOGIN / JOIN
+// ==========================================
 function joinAsWatcher() {
     const input = document.getElementById('streamInput').value;
-    if (!input) return alert("Enter Room Name");
+    if(!input) return alert("Enter Room Name");
     streamId = input;
     document.getElementById('login-overlay').style.display = 'none';
     monitorConnection();
@@ -65,30 +110,31 @@ function joinAsWatcher() {
 
 async function joinAsPresenter() {
     const input = document.getElementById('streamInput').value;
-    if (!input) return alert("Enter Room Name");
+    if(!input) return alert("Enter Room Name");
     streamId = input;
     isPresenter = true;
     document.getElementById('login-overlay').style.display = 'none';
 
-    // 1. Start Upload
     await startPublishing();
-    // 2. Start Download (to see others)
     monitorConnection();
 }
 
-// Ingest
+// ==========================================
+// 4. PRESENTER (INGEST)
+// ==========================================
 async function startPublishing() {
-    preventBackgroundThrottling(); // Keep the audio hack
+    // 1. Hack to keep tab alive in background
+    preventBackgroundThrottling();
 
     try {
-        // 1. MOBILE OPTIMIZATION: Constraint resolution to 720p or 480p
-        // 4K/1080p is too heavy for mobile encoders/upload
+        // 2. MOBILE OPTIMIZATION: Constraint resolution
+        // 720p is max safe resolution for mobile web uploads
         const constraints = {
             audio: true,
             video: {
-                width: { ideal: 1280, max: 1280 }, // Limit width
-                height: { ideal: 720, max: 720 },  // Limit height
-                frameRate: { ideal: 24, max: 30 }  // Limit FPS to save bandwidth
+                width: { ideal: 1280, max: 1280 },
+                height: { ideal: 720, max: 720 },
+                frameRate: { ideal: 24, max: 30 }
             }
         };
 
@@ -100,7 +146,7 @@ async function startPublishing() {
         localVideo.srcObject = stream;
         localVideo.muted = true;
 
-        // Dynamic WebSocket URL (Local/Render compatible)
+        // 3. Dynamic WebSocket (WSS for Render/Prod)
         const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
         const host = window.location.host;
         const wsUrl = `${protocol}://${host}/publish/${streamId}/${myPId}/HIGH`;
@@ -109,16 +155,17 @@ async function startPublishing() {
         socket.binaryType = "arraybuffer";
 
         socket.onopen = () => {
-            console.log("📱 Mobile Presenter Connected");
+            console.log("🎥 PRESENTER: Connected");
 
-            // 2. LOWER BITRATE: 1 Mbps is much safer for mobile upload
+            // 4. BITRATE: 1 Mbps is safe for mobile 4G/5G
             const options = {
                 mimeType: CONFIG.codec,
-                videoBitsPerSecond: 1000000 // 1 Mbps (was 2.5 Mbps)
+                videoBitsPerSecond: 1000000
             };
 
+            // Fallback if browser hates VP8
             if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-                console.warn("Preferred codec not supported, using default.");
+                console.warn(`Codec ${options.mimeType} not supported, using default.`);
                 delete options.mimeType;
             }
 
@@ -127,45 +174,37 @@ async function startPublishing() {
             recorder.ondataavailable = async (event) => {
                 if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
 
-                    // 3. BACKPRESSURE CHECK (CRITICAL FOR MOBILE)
-                    // If the browser has > 64KB buffered, it means the network is slow.
-                    // DROP this packet to let the network catch up.
+                    // 5. CLIENT-SIDE BACKPRESSURE (Crucial for Mobile)
+                    // If buffer is > 64KB, network is lagging. Drop frame to stay live.
                     if (socket.bufferedAmount > 64 * 1024) {
                         console.warn(`🐢 Network slow! Dropping frame. Buffer: ${socket.bufferedAmount}`);
-                        return; // <--- SKIP SENDING
+                        return;
                     }
 
                     socket.send(await event.data.arrayBuffer());
                 }
             };
 
-            // 250ms chunks are good balance
-            recorder.start(250);
+            recorder.start(CONFIG.chunkInterval);
 
-            // Keyframe generator
+            // Keyframe Generator (Force full frame every 2s)
             setInterval(() => {
                 if(recorder.state === "recording") recorder.requestData();
             }, 2000);
         };
 
         socket.onclose = (e) => {
-            console.error("Socket died. Reconnecting...", e);
-            setTimeout(startPublishing, 2000);
+            console.error(`⚠️ Socket Closed: ${e.code}`);
+            if (e.code === 1009) alert("Packet too big! Check server config.");
+            else setTimeout(startPublishing, 2000); // Auto-retry
         };
 
-        // 4. Handle Page Visibility (Switching apps)
-        document.addEventListener("visibilitychange", () => {
-            if (document.visibilityState === 'visible') {
-                if (recorder.state === "paused") recorder.resume();
-            }
-        });
-
     } catch (err) {
-        alert("Camera Error: " + err.message);
+        console.error("Camera Error:", err);
+        alert("Camera Failed: " + err.message);
     }
 }
 
-// AUDIO CONTEXT HACK: Keeps the tab alive even if minimized
 function preventBackgroundThrottling() {
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     if (!AudioContext) return;
@@ -174,31 +213,32 @@ function preventBackgroundThrottling() {
     const gain = ctx.createGain();
     osc.connect(gain);
     gain.connect(ctx.destination);
-    gain.gain.value = 0; // Silent
+    gain.gain.value = 0;
     osc.start();
-    console.log("Anti-Throttle Active");
 }
 
-// Egress
+// ==========================================
+// 5. WATCHER (EGRESS LOOP)
+// ==========================================
 async function monitorConnection() {
     if (isWatching) return;
     isWatching = true;
 
     while (isWatching) {
         try {
-            console.log("WATCHER: Connecting...");
+            console.log("🔌 WATCHER: Connecting...");
             await startWatching();
         } catch (err) {
-            console.error("WATCHER ERROR:", err);
+            console.error("❌ WATCHER ERROR:", err);
         }
-        console.log("Reconnecting in 2s...");
+        console.log("♻️ Reconnecting Watcher in 2s...");
         await new Promise(r => setTimeout(r, 2000));
     }
 }
 
 async function startWatching() {
     const controller = new AbortController();
-    const response = await fetch(`/watch/${streamId}?quality=HIGH`, {signal: controller.signal});
+    const response = await fetch(`/watch/${streamId}?quality=HIGH`, { signal: controller.signal });
 
     if (!response.ok) throw new Error(`Server Status: ${response.status}`);
 
@@ -206,13 +246,13 @@ async function startWatching() {
     const decoder = new TextDecoder();
     let buffer = "";
 
-    console.log("WATCHER: Stream Started");
+    console.log("✅ WATCHER: Stream Started");
 
     while (true) {
-        const {value, done} = await reader.read();
+        const { value, done } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, {stream: true});
+        buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop();
 
@@ -225,37 +265,36 @@ async function startWatching() {
             try {
                 const frame = JSON.parse(jsonString);
                 handleIncomingFrame(frame);
-            } catch (e) {
-                // console.warn("Bad JSON", e);
-            }
+            } catch (e) { }
         }
     }
 }
 
-// Buffer management
+// ==========================================
+// 6. BUFFER & QUEUE MANAGEMENT
+// ==========================================
 function handleIncomingFrame(frameDTO) {
     if (frameDTO.pId === myPId) return;
 
-    // 1. Reset Watchdog
+    // Refresh Watchdog
     lastPacketTime[frameDTO.pId] = Date.now();
 
-    // 2. Setup Tile
+    // Create Tile if new
     if (!activePresenters.has(frameDTO.pId)) {
         createVideoTile(frameDTO.pId, false);
     }
 
-    // 3. Decode
+    // Decode
     const binaryString = window.atob(frameDTO.dataBase64);
     const bytes = new Uint8Array(binaryString.length);
     for (let i = 0; i < binaryString.length; i++) {
         bytes[i] = binaryString.charCodeAt(i);
     }
 
-    // 4. Queue
+    // Queue
     if (!mediaQueues[frameDTO.pId]) mediaQueues[frameDTO.pId] = [];
     mediaQueues[frameDTO.pId].push(bytes);
 
-    // 5. Attempt Process
     processQueue(frameDTO.pId);
 }
 
@@ -264,12 +303,9 @@ function processQueue(pId) {
     const queue = mediaQueues[pId];
     const ms = mediaSources[pId];
 
-    // DEADLOCK PREVENTION:
-    // If SourceBuffer is stuck "updating" for too long, it might be bugged.
-    // But usually 'updating' is true just while appending.
-    if (!sb || sb.updating || !queue || queue.length === 0 || !ms || ms.readyState !== 'open') {
-        return;
-    }
+    // If sourceBuffer is busy (updating), we must wait.
+    // The 'updateend' listener will trigger this function again.
+    if (!sb || sb.updating || !queue || queue.length === 0 || !ms || ms.readyState !== 'open') return;
 
     try {
         const nextChunk = queue.shift();
@@ -277,27 +313,26 @@ function processQueue(pId) {
     } catch (e) {
         console.error("Append Error:", e);
 
-        // Recover from QuotaExceeded
+        // Handle Full Buffer (Garbage Collection)
         if (e.name === 'QuotaExceededError') {
             const video = document.getElementById(`video-${pId}`);
             if (sb.buffered.length > 0) {
                 const removeEnd = video.currentTime - 3;
                 if (removeEnd > 0) {
-                    try {
-                        sb.remove(0, removeEnd);
-                    } catch (ex) {
-                    }
+                    try { sb.remove(0, removeEnd); } catch(ex) {}
                 }
             }
         } else {
-            // If it's another error, putting it back might just loop error.
-            // Better to drop it and wait for next keyframe.
-            console.warn("Dropping bad chunk");
+            // For other errors (InvalidState, Corrupt Chunk), DROP IT.
+            // Do NOT unshift it back, or we loop forever on bad data.
+            console.warn("🗑️ Dropping corrupt chunk");
         }
     }
 }
 
-// UI and Grid
+// ==========================================
+// 7. UI LOGIC
+// ==========================================
 function createVideoTile(pId, isLocal) {
     if (activePresenters.size >= 4) return;
     activePresenters.add(pId);
@@ -319,24 +354,20 @@ function createVideoTile(pId, isLocal) {
         mediaSources[pId] = ms;
 
         ms.onsourceopen = () => {
-            console.log(`MediaSource OPEN for ${pId}`);
-
-            // Verify Codec Support
             if (MediaSource.isTypeSupported(CONFIG.codec)) {
                 const sb = ms.addSourceBuffer(CONFIG.codec);
-                sb.mode = 'sequence'; // Critical for live
+                sb.mode = 'sequence';
                 mediaBuffers[pId] = sb;
                 mediaSourceReady[pId] = true;
 
-                // TRIGGER LOOP
                 sb.addEventListener('updateend', () => processQueue(pId));
 
-                // UNBLOCK: If data arrived while we were initializing, flush it now
+                // Flush any early data
                 if (mediaQueues[pId] && mediaQueues[pId].length > 0) {
                     processQueue(pId);
                 }
             } else {
-                console.error("Browser does not support VP8/Opus!");
+                console.error("Browser does not support codec:", CONFIG.codec);
             }
         };
     }

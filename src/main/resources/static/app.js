@@ -1,13 +1,11 @@
 // ==========================================
-// 1. GLOBAL CONFIG
+// 1. GLOBAL CONFIG (VIDEO ONLY MODE)
 // ==========================================
 const CONFIG = {
-    chunkInterval: 100,      // 100ms = smoother stream, less bursty
-    watchdogTimeout: 30000,  // 30s = very tolerant of lag
-
-    // FALLBACK ONLY: If negotiation fails, we try this.
-    // Note: We removed 'opus' to prevent audio mismatches crashing the video.
-    defaultCodec: 'video/webm; codecs=vp8'
+    chunkInterval: 100,      // Fast updates
+    watchdogTimeout: 10000,
+    // SIMPLEST CODEC POSSIBLE: No Audio, Just VP8 Video
+    codec: 'video/webm; codecs=vp8'
 };
 
 let streamId = "";
@@ -15,63 +13,35 @@ let myPId = "user-" + Math.floor(Math.random() * 100000);
 let isPresenter = false;
 let isWatching = false;
 
-// Logic State
 const activePresenters = new Set();
 const lastPacketTime = {};
-const stuckMonitors = {};
-const presenterCodecs = {}; // Store the EXACT codec for each user
-
-// Media State
 const mediaBuffers = {};
 const mediaSources = {};
 const mediaQueues = {};
 const mediaSourceReady = {};
 
 // ==========================================
-// 2. HEALTH MONITORS
+// 2. WATCHDOG
 // ==========================================
 setInterval(() => {
     const now = Date.now();
     activePresenters.forEach(pId => {
         if (pId === myPId) return;
-
-        // WATCHDOG
-        const lastSeen = lastPacketTime[pId] || 0;
-        if (now - lastSeen > CONFIG.watchdogTimeout) {
-            console.error(`❌ User ${pId} TIMED OUT. Removing.`);
+        if (now - (lastPacketTime[pId] || 0) > CONFIG.watchdogTimeout) {
+            console.error(`❌ User ${pId} TIMED OUT.`);
             removePresenter(pId);
         }
-
-        // VIDEO CPR (Anti-Freeze)
-        const video = document.getElementById(`video-${pId}`);
-        const sb = mediaBuffers[pId];
-        if (video && !video.paused && sb && sb.buffered.length > 0) {
-            if (!stuckMonitors[pId]) stuckMonitors[pId] = { last: 0, count: 0 };
-            const m = stuckMonitors[pId];
-
-            if (Math.abs(video.currentTime - m.last) < 0.1) m.count++;
-            else { m.count = 0; m.last = video.currentTime; }
-
-            if (m.count > 5) { // 5 seconds frozen
-                console.warn(`⚡ Jumpstarting frozen video: ${pId}`);
-                video.currentTime = sb.buffered.end(sb.buffered.length - 1) - 0.1;
-                m.count = 0;
-            }
-        }
     });
-}, 1000);
+}, 2000);
 
 function removePresenter(pId) {
     if (!activePresenters.has(pId)) return;
     activePresenters.delete(pId);
     document.getElementById(`video-${pId}`)?.closest('.video-card')?.remove();
-
     delete mediaBuffers[pId];
     delete mediaQueues[pId];
     delete mediaSources[pId];
     delete lastPacketTime[pId];
-    delete stuckMonitors[pId];
-    delete presenterCodecs[pId];
     updateGridLayout();
 }
 
@@ -79,38 +49,36 @@ function removePresenter(pId) {
 // 3. JOIN LOGIC
 // ==========================================
 function joinAsWatcher() {
-    const input = document.getElementById('streamInput').value;
-    if(!input) return alert("Enter Room Name");
-    streamId = input;
+    streamId = document.getElementById('streamInput').value;
+    if(!streamId) return alert("Enter Room Name");
     document.getElementById('login-overlay').style.display = 'none';
     monitorConnection();
 }
 
 async function joinAsPresenter() {
-    const input = document.getElementById('streamInput').value;
-    if(!input) return alert("Enter Room Name");
-    streamId = input;
+    streamId = document.getElementById('streamInput').value;
+    if(!streamId) return alert("Enter Room Name");
     isPresenter = true;
     document.getElementById('login-overlay').style.display = 'none';
-
     await startPublishing();
-    monitorConnection();
+    monitorConnection(); // Also watch others
 }
 
 // ==========================================
-// 4. PRESENTER (INGEST)
+// 4. PRESENTER (NO AUDIO)
 // ==========================================
 async function startPublishing() {
     preventBackgroundThrottling();
 
     try {
-        // MOBILE OPTIMIZATION
+        // !!! VIDEO ONLY - NO AUDIO !!!
+        // This prevents the "Sync Freeze" issue
         const constraints = {
-            audio: true,
+            audio: false,
             video: {
-                width: { ideal: 640, max: 1280 }, // Lower res = More reliable on phone
+                width: { ideal: 640, max: 1280 },
                 height: { ideal: 480, max: 720 },
-                frameRate: { ideal: 20, max: 30 }
+                frameRate: { ideal: 15, max: 30 } // Lower FPS for stability
             }
         };
 
@@ -130,51 +98,31 @@ async function startPublishing() {
         socket.binaryType = "arraybuffer";
 
         socket.onopen = () => {
-            console.log("🎥 PRESENTER: Connected");
+            console.log("🎥 PRESENTER (Video Only): Connected");
 
-            // ----------------------------------------------------
-            // 1. AUTO-DETECT CODEC
-            // We let the browser pick what it likes best.
-            // ----------------------------------------------------
-            let options = { videoBitsPerSecond: 1000000 };
+            const options = {
+                mimeType: 'video/webm; codecs=vp8',
+                videoBitsPerSecond: 800000 // 800 Kbps
+            };
 
-            // Try specific codecs in order of preference
-            if (MediaRecorder.isTypeSupported('video/webm; codecs="vp8, opus"')) {
-                options.mimeType = 'video/webm; codecs="vp8, opus"';
-            } else if (MediaRecorder.isTypeSupported('video/webm; codecs=vp8')) {
-                options.mimeType = 'video/webm; codecs=vp8';
-            } else if (MediaRecorder.isTypeSupported('video/webm')) {
-                options.mimeType = 'video/webm';
-            } else {
-                console.warn("Using default browser codec (might be mp4/h264)");
+            // Mobile Safari/Chrome fallback
+            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                console.warn("VP8 not supported, falling back to default");
+                delete options.mimeType;
             }
-
-            console.log(`🎙️ Recording using: ${options.mimeType || "default"}`);
 
             const recorder = new MediaRecorder(stream, options);
 
-            // ----------------------------------------------------
-            // 2. SEND METADATA FIRST
-            // We send a text message with the MIME type so watchers know what to expect.
-            // ----------------------------------------------------
-            const meta = { type: 'META', mimeType: recorder.mimeType || "" };
-            socket.send(new TextEncoder().encode(JSON.stringify(meta)));
-
             recorder.ondataavailable = async (event) => {
                 if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
-
-                    // Client-Side Backpressure (Prevent crash)
-                    if (socket.bufferedAmount > 256 * 1024) { // 256KB buffer limit
-                        console.warn(`🐢 Dropping frame. Buffer: ${socket.bufferedAmount}`);
-                        return;
-                    }
+                    if (socket.bufferedAmount > 64 * 1024) return; // Drop if lagging
                     socket.send(await event.data.arrayBuffer());
                 }
             };
 
-            recorder.start(CONFIG.chunkInterval);
+            recorder.start(100); // 100ms chunks
 
-            // Keyframe every 1s (Faster recovery from black screen)
+            // Keyframe Loop
             setInterval(() => {
                 if(recorder.state === "recording") recorder.requestData();
             }, 1000);
@@ -187,27 +135,29 @@ async function startPublishing() {
     }
 }
 
+// Keep the hack just in case
 function preventBackgroundThrottling() {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    gain.gain.value = 0;
-    osc.start();
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        gain.gain.value = 0;
+        osc.start();
+    } catch(e) {}
 }
 
 // ==========================================
-// 5. WATCHER (EGRESS)
+// 5. WATCHER
 // ==========================================
 async function monitorConnection() {
     if (isWatching) return;
     isWatching = true;
 
     while (isWatching) {
-        try {
-            await startWatching();
-        } catch (err) { console.error("Watcher retry:", err); }
+        try { await startWatching(); }
+        catch (err) { console.error(err); }
         await new Promise(r => setTimeout(r, 2000));
     }
 }
@@ -229,31 +179,17 @@ async function startWatching() {
         for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
-
-            let jsonString = trimmed.startsWith("data:") ? trimmed.substring(5) : trimmed;
             try {
-                // Check if it's the raw string (JSON) or something else
-                const frame = JSON.parse(jsonString);
+                const frame = JSON.parse(trimmed.startsWith("data:") ? trimmed.substring(5) : trimmed);
                 handleIncomingFrame(frame);
             } catch (e) { }
         }
     }
 }
 
-// ==========================================
-// 6. FRAME PROCESSING
-// ==========================================
 function handleIncomingFrame(frameDTO) {
     if (frameDTO.pId === myPId) return;
     lastPacketTime[frameDTO.pId] = Date.now();
-
-    // ------------------------------------------------
-    // 1. HANDLE METADATA (MIME TYPE)
-    // ------------------------------------------------
-    // If the server passes the JSON we sent earlier, we might catch it here.
-    // NOTE: In your current backend, you wrap bytes in VideoFrame.
-    // If we sent text earlier, the backend tries to treat it as video.
-    // Simplification: We will try to sniff the first bytes or just use the CONFIG fallback.
 
     if (!activePresenters.has(frameDTO.pId)) {
         createVideoTile(frameDTO.pId, false);
@@ -263,20 +199,6 @@ function handleIncomingFrame(frameDTO) {
     const bytes = new Uint8Array(binaryString.length);
     for (let i = 0; i < binaryString.length; i++) {
         bytes[i] = binaryString.charCodeAt(i);
-    }
-
-    // Check if this is our META packet (JSON text inside binary)
-    // "{"type":"META"..." is {123, 34, 116, 121...}
-    if (bytes[0] === 123 && bytes[1] === 34) {
-        try {
-            const text = new TextDecoder().decode(bytes);
-            const meta = JSON.parse(text);
-            if (meta.type === 'META') {
-                console.log(`🎥 Received Codec for ${frameDTO.pId}: ${meta.mimeType}`);
-                presenterCodecs[frameDTO.pId] = meta.mimeType;
-                return; // Don't append this to buffer
-            }
-        } catch(e) {}
     }
 
     if (!mediaQueues[frameDTO.pId]) mediaQueues[frameDTO.pId] = [];
@@ -295,20 +217,16 @@ function processQueue(pId) {
         const nextChunk = queue.shift();
         sb.appendBuffer(nextChunk);
     } catch (e) {
-        // Quota: Clean up
+        // Reset Buffer if full
         if (e.name === 'QuotaExceededError') {
             const video = document.getElementById(`video-${pId}`);
-            if (sb.buffered.length > 0) {
-                try { sb.remove(0, video.currentTime - 2); } catch(ex) {}
-            }
+            try { sb.remove(0, video.currentTime - 1); } catch(ex) {}
         }
-        // InvalidState: Usually means header/codec mismatch.
-        // We drop the chunk.
     }
 }
 
 // ==========================================
-// 7. UI LOGIC
+// 6. UI
 // ==========================================
 function createVideoTile(pId, isLocal) {
     if (activePresenters.size >= 4) return;
@@ -318,10 +236,7 @@ function createVideoTile(pId, isLocal) {
     const card = document.createElement('div');
     card.className = 'video-card';
     card.innerHTML = `
-        <div style="position: relative; width: 100%; height: 100%;">
-            <video id="video-${pId}" autoplay playsinline muted style="width:100%; height:100%; object-fit: cover; background: #000;"></video>
-            ${!isLocal ? `<button id="btn-${pId}" style="position: absolute; top: 10px; right: 10px; z-index: 10; padding: 5px;">🔇</button>` : ''}
-        </div>
+        <video id="video-${pId}" autoplay playsinline muted style="width:100%; height:100%; object-fit: cover; background: #000;"></video>
         <div class="label">${isLocal ? "Me" : pId}</div>
     `;
     grid.appendChild(card);
@@ -329,38 +244,21 @@ function createVideoTile(pId, isLocal) {
 
     if (!isLocal) {
         const video = card.querySelector('video');
-        const btn = card.querySelector(`#btn-${pId}`);
-        if(btn) btn.onclick = () => { video.muted = !video.muted; btn.innerText = video.muted ? "🔇" : "🔊"; };
-
         const ms = new MediaSource();
         video.src = URL.createObjectURL(ms);
         mediaSources[pId] = ms;
 
         ms.onsourceopen = () => {
-            // USE NEGOTIATED CODEC OR FALLBACK
-            // If we received the META packet, use it. Otherwise use generic VP8.
-            let mime = presenterCodecs[pId] || CONFIG.defaultCodec;
-
-            // Safety: If the mime type is empty or invalid, fallback
-            if (!mime || mime === "") mime = 'video/webm; codecs=vp8';
-
-            console.log(`⚙️ Initializing SourceBuffer for ${pId} with: ${mime}`);
-
+            // GENERIC VP8 ONLY
+            const mime = 'video/webm; codecs=vp8';
             if (MediaSource.isTypeSupported(mime)) {
                 const sb = ms.addSourceBuffer(mime);
                 sb.mode = 'sequence';
                 mediaBuffers[pId] = sb;
-
                 sb.addEventListener('updateend', () => processQueue(pId));
                 if (mediaQueues[pId]?.length > 0) processQueue(pId);
             } else {
-                console.error(`Browser cannot play this format: ${mime}`);
-                // Attempt ultra-basic fallback
-                try {
-                    const sb = ms.addSourceBuffer('video/webm');
-                    mediaBuffers[pId] = sb;
-                    sb.addEventListener('updateend', () => processQueue(pId));
-                } catch(e) { console.error("Fallback failed", e); }
+                console.error("Browser rejected VP8");
             }
         };
     }

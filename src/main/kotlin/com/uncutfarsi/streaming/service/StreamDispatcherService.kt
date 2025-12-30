@@ -55,17 +55,24 @@ class StreamDispatcherService {
     @Scheduled(fixedRate = 2000)
     fun cleanUpInactivePresenters() {
         val now = System.currentTimeMillis()
-        val timeout = 20000L
 
-        lastHeartbeat.entries.removeIf { (key, lastSeen) ->
-            if (now - lastSeen > timeout) {
+        val iterator = lastHeartbeat.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            val key = entry.key
+            val lastSeen = entry.value
+
+            if (now - lastSeen > TIMEOUT) {
+                println("Removing dead stream: $key")
+
                 streamHeaders.remove(key)
-                println("Cleaning up inactive stream: $key")
-                true
-            } else {
-                false
+                iterator.remove() // Removes from lastHeartbeat safely
             }
         }
+    }
+
+    private companion object {
+        private const val TIMEOUT = 10000L // Must match frontend roughly
     }
 
 }

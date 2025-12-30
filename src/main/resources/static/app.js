@@ -1,6 +1,6 @@
 const CONFIG = {
     chunkInterval: 250,      // 250ms: Balance between low latency and stability
-    watchdogTimeout: 20000,  // 20s: Tolerance for network lag
+    watchdogTimeout: 10000,  // 20s: Tolerance for network lag
     codec: 'video/webm; codecs="vp8, opus"' // VP8 + Opus Audio
 };
 
@@ -17,9 +17,7 @@ const mediaSources = {};
 const mediaQueues = {};
 const mediaSourceReady = {};
 
-// ==========================================
-// 2. WATCHDOG (AUTO-CLEANUP)
-// ==========================================
+// Auto cleanup
 setInterval(() => {
     const now = Date.now();
     activePresenters.forEach(pId => {
@@ -57,9 +55,6 @@ function removePresenter(pId) {
     updateGridLayout();
 }
 
-// ==========================================
-// 3. LOGIN LOGIC
-// ==========================================
 function joinAsWatcher() {
     const input = document.getElementById('streamInput').value;
     if (!input) return alert("Enter Room Name");
@@ -81,9 +76,7 @@ async function joinAsPresenter() {
     monitorConnection();
 }
 
-// ==========================================
-// 4. PRESENTER (INGEST)
-// ==========================================
+// Ingest
 async function startPublishing() {
     // HACK: Prevent Browser Throttling when tab is in background
     preventBackgroundThrottling();
@@ -160,9 +153,7 @@ function preventBackgroundThrottling() {
     console.log("Anti-Throttle Active");
 }
 
-// ==========================================
-// 5. WATCHER (EGRESS)
-// ==========================================
+// Egress
 async function monitorConnection() {
     if (isWatching) return;
     isWatching = true;
@@ -215,9 +206,7 @@ async function startWatching() {
     }
 }
 
-// ==========================================
-// 6. BUFFER MANAGEMENT
-// ==========================================
+// Buffer management
 function handleIncomingFrame(frameDTO) {
     if (frameDTO.pId === myPId) return;
 
@@ -282,9 +271,7 @@ function processQueue(pId) {
     }
 }
 
-// ==========================================
-// 7. UI & GRID
-// ==========================================
+// UI and Grid
 function createVideoTile(pId, isLocal) {
     if (activePresenters.size >= 4) return;
     activePresenters.add(pId);

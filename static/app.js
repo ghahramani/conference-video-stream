@@ -2,89 +2,158 @@
 // 1. GLOBAL CONFIGURATION
 // ==========================================
 const CONFIG = {
-    chunkInterval: 100,      // 100ms chunks = Low Latency
-    watchdogTimeout: 2000,  // 2s timeout before removing a disconnected user
+    chunkInterval: 100,
+    watchdogTimeout: 5000,
+    maxLatency: 0.5,
 };
 
-// Global State
 let streamId = "";
+let myName = "User";
 let myPId = "user-" + Math.floor(Math.random() * 100000);
 let isPresenter = false;
 let isWatching = false;
+let sessionStartTime = Date.now();
 
-// Logic State
+// NEW: Track Socket State
+let isSocketConnected = false;
+
 const activePresenters = new Set();
 const lastPacketTime = {};
-
-// Media State
-const mediaBuffers = {};   // pId -> SourceBuffer
-const mediaSources = {};   // pId -> MediaSource
-const mediaQueues = {};    // pId -> Array<Uint8Array>
+const stuckMonitors = {};
+const mediaBuffers = {};
+const mediaSources = {};
+const mediaQueues = {};
 
 // ==========================================
-// 2. WATCHDOG & CLEANUP
+// 2. WATCHDOG & STATS
 // ==========================================
-// Removes users who haven't sent data in 20 seconds
 setInterval(() => {
     const now = Date.now();
     activePresenters.forEach(pId => {
         if (pId === myPId) return;
-
         const lastSeen = lastPacketTime[pId] || 0;
         if (now - lastSeen > CONFIG.watchdogTimeout) {
-            console.error(`❌ User ${pId} TIMED OUT.`);
+            console.warn(`❌ User ${pId} TIMED OUT.`);
             removePresenter(pId);
         }
     });
 }, 2000);
 
+setInterval(() => {
+    const uptime = Math.floor((Date.now() - sessionStartTime) / 1000);
+    const uptimeStr = new Date(uptime * 1000).toISOString().substr(11, 8);
+
+    activePresenters.forEach(pId => {
+        const video = document.getElementById(`video-${pId}`);
+        const statsEl = document.getElementById(`stats-${pId}`);
+        if (!video) return;
+
+        // ---------------------------------------------
+        // CASE 1: ME (LOCAL) - CHECK SOCKET STATE
+        // ---------------------------------------------
+        if (pId === myPId) {
+            if (statsEl) {
+                if (isSocketConnected) {
+                    statsEl.innerHTML = `⏱️ ${uptimeStr} (Live)`;
+                    statsEl.style.color = "#0f0"; // Green
+                } else {
+                    statsEl.innerHTML = `⚠️ Reconnecting...`;
+                    statsEl.style.color = "orange"; // Orange/Red
+                }
+            }
+            return;
+        }
+
+        // ---------------------------------------------
+        // CASE 2: REMOTE (BUFFERED)
+        // ---------------------------------------------
+        const sb = mediaBuffers[pId];
+        if (!sb) return;
+
+        let lag = 0;
+        if (sb.buffered.length > 0) {
+            lag = sb.buffered.end(sb.buffered.length - 1) - video.currentTime;
+        }
+
+        if (statsEl) {
+            statsEl.innerHTML = `
+                ⏱️ ${uptimeStr}<br>
+                📉 Lag: <span style="color: ${lag > 1.0 ? 'red' : '#0f0'}">${lag.toFixed(2)}s</span>
+            `;
+        }
+
+        if (lag > CONFIG.maxLatency) {
+            video.currentTime = sb.buffered.end(sb.buffered.length - 1) - 0.1;
+        }
+
+        if (video.paused) return;
+        const lastTime = stuckMonitors[pId] || 0;
+        if (Math.abs(video.currentTime - lastTime) < 0.05 && sb.buffered.length > 0) {
+            video.currentTime = sb.buffered.end(sb.buffered.length - 1) - 0.1;
+        }
+        stuckMonitors[pId] = video.currentTime;
+    });
+}, 500);
+
 function removePresenter(pId) {
     if (!activePresenters.has(pId)) return;
     activePresenters.delete(pId);
-
-    // Remove UI
-    const videoEl = document.getElementById(`video-${pId}`);
-    if (videoEl) videoEl.closest('.video-card')?.remove();
-
-    // Clear Memory
+    document.getElementById(`video-${pId}`)?.closest('.video-card')?.remove();
     delete mediaBuffers[pId];
     delete mediaQueues[pId];
     delete mediaSources[pId];
     delete lastPacketTime[pId];
-
+    delete stuckMonitors[pId];
     updateGridLayout();
+}
+
+function removeAllRemotePresenters() {
+    activePresenters.forEach(pId => {
+        if (pId !== myPId) removePresenter(pId);
+    });
 }
 
 // ==========================================
 // 3. JOIN LOGIC
 // ==========================================
 function joinAsWatcher() {
-    const input = document.getElementById('streamInput').value;
-    if (!input) return alert("Enter Room Name");
-    streamId = input;
+    const roomInput = document.getElementById('streamInput').value;
+    const nameInput = document.getElementById('usernameInput').value;
+
+    if (!roomInput || !nameInput) return alert("Enter Room and Name");
+
+    streamId = roomInput;
+    myName = nameInput;
+
     document.getElementById('login-overlay').style.display = 'none';
+    sessionStartTime = Date.now();
     monitorConnection();
 }
 
 async function joinAsPresenter() {
-    const input = document.getElementById('streamInput').value;
-    if (!input) return alert("Enter Room Name");
-    streamId = input;
+    const roomInput = document.getElementById('streamInput').value;
+    const nameInput = document.getElementById('usernameInput').value;
+
+    if (!roomInput || !nameInput) return alert("Enter Room and Name");
+
+    streamId = roomInput;
+    myName = nameInput;
     isPresenter = true;
+
     document.getElementById('login-overlay').style.display = 'none';
+    sessionStartTime = Date.now();
 
     await startPublishing();
-    monitorConnection(); // Presenters also watch others
+    monitorConnection();
 }
 
 // ==========================================
-// 4. PRESENTER (SENDING VIDEO)
+// 4. PRESENTER
 // ==========================================
 async function startPublishing() {
     preventBackgroundThrottling();
 
     try {
-        // 1. Get Camera & Mic
         const constraints = {
             audio: true,
             video: {
@@ -96,76 +165,72 @@ async function startPublishing() {
 
         const stream = await navigator.mediaDevices.getUserMedia(constraints);
 
-        // Show Local Preview
-        createVideoTile(myPId, true);
-        const localVideo = document.getElementById(`video-${myPId}`);
-        localVideo.srcObject = stream;
-        localVideo.muted = true; // Always mute self
+        if (!document.getElementById(`video-${myPId}`)) {
+            createVideoTile(myPId, true, myName);
+            const localVideo = document.getElementById(`video-${myPId}`);
+            localVideo.srcObject = stream;
+            localVideo.muted = true;
+        }
 
-        // 2. Connect WebSocket
         const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
         const host = window.location.host;
-        const wsUrl = `${protocol}://${host}/publish/${streamId}/${myPId}/HIGH`;
+        const encodedName = encodeURIComponent(myName);
+        const wsUrl = `${protocol}://${host}/publish/${streamId}/${myPId}/HIGH/${encodedName}`;
 
         const socket = new WebSocket(wsUrl);
         socket.binaryType = "arraybuffer";
 
         socket.onopen = () => {
             console.log("🎥 PRESENTER: Connected");
+            isSocketConnected = true; // <--- UPDATE STATE
 
-            // 3. Setup Recorder
-            // We do NOT hardcode mimeType. We let the browser pick (VP8 for Chrome, H.264 for iOS).
             const options = {videoBitsPerSecond: 1000000};
             const recorder = new MediaRecorder(stream, options);
-
-            console.log(`🎙️ Recording using: ${recorder.mimeType}`);
+            console.log(`🎙️ Codec: ${recorder.mimeType}`);
 
             recorder.ondataavailable = async (event) => {
                 if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
-                    // Backpressure check (skip frame if network is choked)
                     if (socket.bufferedAmount > 64 * 1024) return;
-
                     socket.send(await event.data.arrayBuffer());
                 }
             };
 
-            // Start recording (fires dataavailable every 100ms)
             recorder.start(CONFIG.chunkInterval);
 
-            // 4. KEYFRAME GENERATOR (The Late Joiner Fix)
-            // Forces a full picture every 1 second so new watchers don't wait long.
             setInterval(() => {
                 if (recorder.state === "recording") recorder.requestData();
             }, 1000);
         };
 
         socket.onclose = () => {
-            console.warn("⚠️ Socket closed. Reconnecting in 2s...");
+            console.warn("⚠️ Socket closed. Retrying in 2s...");
+            isSocketConnected = false; // <--- UPDATE STATE
             setTimeout(startPublishing, 2000);
+        };
+
+        socket.onerror = (err) => {
+            console.error("❌ Socket Error:", err);
+            isSocketConnected = false; // <--- UPDATE STATE
+            socket.close();
         };
 
     } catch (err) {
         alert("Camera Failed: " + err.message);
-        console.error(err);
     }
 }
 
-// Hack to keep tab active in background
 function preventBackgroundThrottling() {
     try {
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        gain.gain.value = 0;
         osc.start();
     } catch (e) {
     }
 }
 
 // ==========================================
-// 5. WATCHER (RECEIVING VIDEO)
+// 5. WATCHER
 // ==========================================
 async function monitorConnection() {
     if (isWatching) return;
@@ -175,15 +240,17 @@ async function monitorConnection() {
         try {
             await startWatching();
         } catch (err) {
-            console.error("Watcher Error:", err);
+            console.error("⚠️ Connection Lost:", err);
+            removeAllRemotePresenters();
         }
-        console.log("♻️ Reconnecting Watcher...");
         await new Promise(r => setTimeout(r, 2000));
     }
 }
 
 async function startWatching() {
     const response = await fetch(`/watch/${streamId}?quality=HIGH`);
+    if (!response.ok) throw new Error("Server Down");
+
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -200,7 +267,6 @@ async function startWatching() {
             const trimmed = line.trim();
             if (!trimmed) continue;
             try {
-                // Parse "data: {...}"
                 const jsonStr = trimmed.startsWith("data:") ? trimmed.substring(5) : trimmed;
                 const frame = JSON.parse(jsonStr);
                 handleIncomingFrame(frame);
@@ -212,29 +278,22 @@ async function startWatching() {
 
 function handleIncomingFrame(frameDTO) {
     if (frameDTO.pId === myPId) return;
-
-    // Update Watchdog
     lastPacketTime[frameDTO.pId] = Date.now();
 
-    // Create Tile if not exists
     if (!activePresenters.has(frameDTO.pId)) {
-        createVideoTile(frameDTO.pId, false);
+        createVideoTile(frameDTO.pId, false, frameDTO.name || frameDTO.pId);
     }
 
-    // Decode Base64
     const binaryString = window.atob(frameDTO.dataBase64);
     const bytes = new Uint8Array(binaryString.length);
     for (let i = 0; i < binaryString.length; i++) {
         bytes[i] = binaryString.charCodeAt(i);
     }
 
-    // 1. LAZY INIT: If we haven't set up the player for this user yet, do it now.
-    // This expects the FIRST packet to be the Header (thanks to Rust fix).
     if (!mediaBuffers[frameDTO.pId]) {
         setupPlayerBruteForce(frameDTO.pId, bytes);
     }
 
-    // 2. Queue Data
     if (!mediaQueues[frameDTO.pId]) mediaQueues[frameDTO.pId] = [];
     mediaQueues[frameDTO.pId].push(bytes);
 
@@ -242,35 +301,27 @@ function handleIncomingFrame(frameDTO) {
 }
 
 // ==========================================
-// 6. CODEC BRUTE FORCE (The Magic Fix)
+// 6. CODEC
 // ==========================================
 function setupPlayerBruteForce(pId, firstChunk) {
     const ms = mediaSources[pId];
     if (!ms || ms.readyState !== 'open') return;
 
-    // Debug: Print Magic Bytes
-    const hex = Array.from(firstChunk.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join(' ');
-    console.log(`🔍 Init Player ${pId}. Magic Bytes: [ ${hex} ]`);
-
-    // List of codecs to try (in order of likelihood)
     const candidates = [
-        'video/webm; codecs="vp8, opus"',           // Standard WebM (Chrome/Android)
-        'video/mp4; codecs="avc1.42E01E, mp4a.40.2"', // Standard MP4 (iOS/Safari)
-        'video/webm',                               // Generic WebM
-        'video/mp4'                                 // Generic MP4
+        'video/webm; codecs="vp8, opus"',
+        'video/mp4; codecs="avc1.42E01E, mp4a.40.2"',
+        'video/webm',
+        'video/mp4'
     ];
 
     let sb = null;
-
     for (const mime of candidates) {
         if (MediaSource.isTypeSupported(mime)) {
             try {
-                // Attempt to create SourceBuffer with this codec
                 sb = ms.addSourceBuffer(mime);
-                console.log(`✅ ${pId} assigned codec: ${mime}`);
-                break; // It worked! Stop trying others.
+                console.log(`✅ ${pId} using ${mime}`);
+                break;
             } catch (e) {
-                console.warn(`❌ Browser rejected ${mime}`);
             }
         }
     }
@@ -278,9 +329,20 @@ function setupPlayerBruteForce(pId, firstChunk) {
     if (sb) {
         sb.mode = 'sequence';
         mediaBuffers[pId] = sb;
-        sb.addEventListener('updateend', () => processQueue(pId));
-    } else {
-        console.error("💥 CRITICAL: Browser could not play this stream format.");
+        let isFirstAppend = true;
+        sb.addEventListener('updateend', () => {
+            if (isFirstAppend) {
+                isFirstAppend = false;
+                const video = document.getElementById(`video-${pId}`);
+                try {
+                    if (sb.buffered.length > 0) {
+                        video.currentTime = sb.buffered.end(0) - 0.1;
+                    }
+                } catch (e) {
+                }
+            }
+            processQueue(pId);
+        });
     }
 }
 
@@ -295,8 +357,6 @@ function processQueue(pId) {
         const nextChunk = queue.shift();
         sb.appendBuffer(nextChunk);
     } catch (e) {
-        console.error("Append Error:", e);
-        // If buffer is full, remove old video to make space
         if (e.name === 'QuotaExceededError') {
             const video = document.getElementById(`video-${pId}`);
             try {
@@ -310,31 +370,36 @@ function processQueue(pId) {
 // ==========================================
 // 7. UI HELPER
 // ==========================================
-function createVideoTile(pId, isLocal) {
+function createVideoTile(pId, isLocal, displayName) {
+    if (document.getElementById(`video-${pId}`)) return;
+
     if (activePresenters.size >= 4) return;
     activePresenters.add(pId);
+
+    const nameToShow = displayName || (isLocal ? myName : "Unknown");
 
     const grid = document.getElementById('video-grid');
     const card = document.createElement('div');
     card.className = 'video-card';
 
-    // Add "Unmute" button for remote streams (Autoplay requires mute initially)
     card.innerHTML = `
-        <div style="position: relative; width: 100%; height: 100%;">
-            <video id="video-${pId}" autoplay playsinline muted style="width:100%; height:100%; object-fit: cover; background: #000;"></video>
-            ${!isLocal ? `<button id="btn-${pId}" style="position: absolute; top: 10px; right: 10px; z-index: 10; padding: 5px 10px;">🔇 Unmute</button>` : ''}
+        <div class="video-wrapper">
+            <video id="video-${pId}" autoplay playsinline muted></video>
+            
+            ${!isLocal ? `<button id="btn-${pId}" class="unmute-btn">🔇 Unmute</button>` : ''}
+            
+            <div id="stats-${pId}" class="stats-overlay">
+                Connecting...
+            </div>
         </div>
-        <div class="label">${isLocal ? "Me" : pId}</div>
+        <div class="label">${isLocal ? "Me (" + nameToShow + ")" : nameToShow}</div>
     `;
     grid.appendChild(card);
     updateGridLayout();
 
-    // Setup MediaSource for remote user
     if (!isLocal) {
         const video = card.querySelector('video');
         const btn = card.querySelector(`#btn-${pId}`);
-
-        // Unmute Logic
         if (btn) btn.onclick = () => {
             video.muted = !video.muted;
             btn.innerText = video.muted ? "🔇 Unmute" : "🔊 On";
@@ -343,7 +408,6 @@ function createVideoTile(pId, isLocal) {
         const ms = new MediaSource();
         video.src = URL.createObjectURL(ms);
         mediaSources[pId] = ms;
-        // Note: We do NOT addSourceBuffer here. We wait for the first packet to detect the codec.
     }
 }
 

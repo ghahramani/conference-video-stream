@@ -43,10 +43,45 @@ body {
     box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
 }
 
+/* NEW: Wrapper for relative positioning */
+.video-wrapper {
+    position: relative;
+    width: 100%;
+    height: 100%;
+}
+
 video {
     width: 100%;
     height: 100%;
     object-fit: cover;
+    background: #000; /* Ensures black background while loading */
+}
+
+/* NEW: Stats Overlay (Timer & Lag) */
+.stats-overlay {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 12px;
+    z-index: 10;
+    pointer-events: none; /* Let clicks pass through to video */
+}
+
+/* NEW: Unmute Button Position */
+.unmute-btn {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 10;
+    padding: 5px 10px;
+    font-size: 0.8rem;
+    background-color: rgba(255, 255, 255, 0.9);
+    color: #000;
 }
 
 .label {
@@ -57,6 +92,7 @@ video {
     padding: 4px 8px;
     border-radius: 4px;
     font-size: 0.9rem;
+    z-index: 10;
 }
 
 #login-overlay {

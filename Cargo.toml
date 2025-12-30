@@ -27,3 +27,4 @@ dashmap = "6.1.0"
 base64 = "0.22"
 
 async-stream = "0.3"
+urlencoding = "2.1.3"

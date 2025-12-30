@@ -78,11 +78,21 @@ async function joinAsPresenter() {
 
 // Ingest
 async function startPublishing() {
-    // HACK: Prevent Browser Throttling when tab is in background
-    preventBackgroundThrottling();
+    preventBackgroundThrottling(); // Keep the audio hack
 
     try {
-        const stream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
+        // 1. MOBILE OPTIMIZATION: Constraint resolution to 720p or 480p
+        // 4K/1080p is too heavy for mobile encoders/upload
+        const constraints = {
+            audio: true,
+            video: {
+                width: { ideal: 1280, max: 1280 }, // Limit width
+                height: { ideal: 720, max: 720 },  // Limit height
+                frameRate: { ideal: 24, max: 30 }  // Limit FPS to save bandwidth
+            }
+        };
+
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
 
         // Local Preview
         createVideoTile(myPId, true);
@@ -90,24 +100,25 @@ async function startPublishing() {
         localVideo.srcObject = stream;
         localVideo.muted = true;
 
-        // WebSocket Setup
+        // Dynamic WebSocket URL (Local/Render compatible)
         const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
         const host = window.location.host;
         const wsUrl = `${protocol}://${host}/publish/${streamId}/${myPId}/HIGH`;
+
         const socket = new WebSocket(wsUrl);
         socket.binaryType = "arraybuffer";
 
         socket.onopen = () => {
-            console.log("PRESENTER: Connected to Server");
+            console.log("📱 Mobile Presenter Connected");
 
+            // 2. LOWER BITRATE: 1 Mbps is much safer for mobile upload
             const options = {
                 mimeType: CONFIG.codec,
-                videoBitsPerSecond: 2500000
+                videoBitsPerSecond: 1000000 // 1 Mbps (was 2.5 Mbps)
             };
 
-            // Codec Fallback
             if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-                console.warn(`Codec ${options.mimeType} not supported, using default.`);
+                console.warn("Preferred codec not supported, using default.");
                 delete options.mimeType;
             }
 
@@ -115,29 +126,42 @@ async function startPublishing() {
 
             recorder.ondataavailable = async (event) => {
                 if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
-                    // Send data
+
+                    // 3. BACKPRESSURE CHECK (CRITICAL FOR MOBILE)
+                    // If the browser has > 64KB buffered, it means the network is slow.
+                    // DROP this packet to let the network catch up.
+                    if (socket.bufferedAmount > 64 * 1024) {
+                        console.warn(`🐢 Network slow! Dropping frame. Buffer: ${socket.bufferedAmount}`);
+                        return; // <--- SKIP SENDING
+                    }
+
                     socket.send(await event.data.arrayBuffer());
                 }
             };
 
-            // START RECORDING (250ms chunks = Sweet Spot)
-            recorder.start(CONFIG.chunkInterval);
+            // 250ms chunks are good balance
+            recorder.start(250);
 
-            // KEYFRAME GENERATOR: Request full frame every 2s
+            // Keyframe generator
             setInterval(() => {
-                if (recorder.state === "recording") recorder.requestData();
+                if(recorder.state === "recording") recorder.requestData();
             }, 2000);
         };
 
         socket.onclose = (e) => {
-            console.error(`SOCKET CLOSED: Code ${e.code}, Reason: ${e.reason}`);
-            if (e.code === 1009) alert("Packet too big! Check server config.");
-            else setTimeout(startPublishing, 2000); // Auto-retry
+            console.error("Socket died. Reconnecting...", e);
+            setTimeout(startPublishing, 2000);
         };
 
+        // 4. Handle Page Visibility (Switching apps)
+        document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState === 'visible') {
+                if (recorder.state === "paused") recorder.resume();
+            }
+        });
+
     } catch (err) {
-        console.error("Camera Error:", err);
-        alert("Camera Failed: " + err.message);
+        alert("Camera Error: " + err.message);
     }
 }
 

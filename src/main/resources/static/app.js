@@ -1,11 +1,16 @@
 // ==========================================
-// 1. GLOBAL CONFIG (VIDEO ONLY MODE)
+// 1. GLOBAL CONFIG
 // ==========================================
 const CONFIG = {
-    chunkInterval: 100,      // Fast updates
-    watchdogTimeout: 10000,
-    // SIMPLEST CODEC POSSIBLE: No Audio, Just VP8 Video
-    codec: 'video/webm; codecs=vp8'
+    chunkInterval: 100,      // 100ms chunks = smoother "live" feel
+    watchdogTimeout: 10000,  // 20s disconnect tolerance
+
+    // VIDEO ONLY MODE (safest for sync)
+    // If you need audio, change to 'video/webm; codecs="vp8, opus"'
+    codec: 'video/webm; codecs="vp8, opus"',
+
+    // Latency Control
+    maxLatency: 0.5          // If latency > 0.5s, jump to live
 };
 
 let streamId = "";
@@ -18,11 +23,37 @@ const lastPacketTime = {};
 const mediaBuffers = {};
 const mediaSources = {};
 const mediaQueues = {};
-const mediaSourceReady = {};
 
 // ==========================================
-// 2. WATCHDOG
+// 2. LATENCY KILLER & WATCHDOG
 // ==========================================
+
+// A. LATENCY MANAGER (The 15s Delay Fix)
+setInterval(() => {
+    activePresenters.forEach(pId => {
+        const video = document.getElementById(`video-${pId}`);
+        const sb = mediaBuffers[pId];
+
+        // Safety checks
+        if (!video || !sb || video.paused || sb.buffered.length === 0) return;
+
+        // Calculate Latency
+        // buffered.end = The timestamp of the LATEST data we have
+        // currentTime  = The timestamp of what we are SEEING
+        const bufferedEnd = sb.buffered.end(sb.buffered.length - 1);
+        const latency = bufferedEnd - video.currentTime;
+
+        // If we are behind by more than the limit, JUMP.
+        if (latency > CONFIG.maxLatency) {
+            console.log(`⏩ Catching up ${pId}: Lag was ${latency.toFixed(2)}s`);
+
+            // Jump to 0.1s before the very end (Live Edge)
+            video.currentTime = bufferedEnd - 0.1;
+        }
+    });
+}, 1000); // Check every second
+
+// B. WATCHDOG (Disconnects)
 setInterval(() => {
     const now = Date.now();
     activePresenters.forEach(pId => {
@@ -50,47 +81,43 @@ function removePresenter(pId) {
 // ==========================================
 function joinAsWatcher() {
     streamId = document.getElementById('streamInput').value;
-    if(!streamId) return alert("Enter Room Name");
+    if (!streamId) return alert("Enter Room Name");
     document.getElementById('login-overlay').style.display = 'none';
     monitorConnection();
 }
 
 async function joinAsPresenter() {
     streamId = document.getElementById('streamInput').value;
-    if(!streamId) return alert("Enter Room Name");
+    if (!streamId) return alert("Enter Room Name");
     isPresenter = true;
     document.getElementById('login-overlay').style.display = 'none';
     await startPublishing();
-    monitorConnection(); // Also watch others
+    monitorConnection();
 }
 
 // ==========================================
-// 4. PRESENTER (NO AUDIO)
+// 4. PRESENTER
 // ==========================================
 async function startPublishing() {
     preventBackgroundThrottling();
 
     try {
-        // !!! VIDEO ONLY - NO AUDIO !!!
-        // This prevents the "Sync Freeze" issue
         const constraints = {
-            audio: false,
+            audio: false, // Keep disabled to isolate video sync issues first
             video: {
-                width: { ideal: 640, max: 1280 },
-                height: { ideal: 480, max: 720 },
-                frameRate: { ideal: 15, max: 30 } // Lower FPS for stability
+                width: {ideal: 640, max: 1280},
+                height: {ideal: 480, max: 720},
+                frameRate: {ideal: 15, max: 30}
             }
         };
 
         const stream = await navigator.mediaDevices.getUserMedia(constraints);
 
-        // Local Preview
         createVideoTile(myPId, true);
         const localVideo = document.getElementById(`video-${myPId}`);
         localVideo.srcObject = stream;
         localVideo.muted = true;
 
-        // WebSocket
         const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
         const host = window.location.host;
         const wsUrl = `${protocol}://${host}/publish/${streamId}/${myPId}/HIGH`;
@@ -98,33 +125,32 @@ async function startPublishing() {
         socket.binaryType = "arraybuffer";
 
         socket.onopen = () => {
-            console.log("🎥 PRESENTER (Video Only): Connected");
+            console.log("🎥 PRESENTER Connected");
 
             const options = {
-                mimeType: 'video/webm; codecs=vp8',
-                videoBitsPerSecond: 800000 // 800 Kbps
+                mimeType: CONFIG.codec,
+                videoBitsPerSecond: 800000
             };
 
-            // Mobile Safari/Chrome fallback
             if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-                console.warn("VP8 not supported, falling back to default");
-                delete options.mimeType;
+                delete options.mimeType; // Browser default
             }
 
             const recorder = new MediaRecorder(stream, options);
 
             recorder.ondataavailable = async (event) => {
                 if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
-                    if (socket.bufferedAmount > 64 * 1024) return; // Drop if lagging
+                    // Mobile Backpressure: Drop frame if network is busy
+                    if (socket.bufferedAmount > 64 * 1024) return;
                     socket.send(await event.data.arrayBuffer());
                 }
             };
 
-            recorder.start(100); // 100ms chunks
+            recorder.start(CONFIG.chunkInterval);
 
-            // Keyframe Loop
+            // Frequent Keyframes help new watchers join faster
             setInterval(() => {
-                if(recorder.state === "recording") recorder.requestData();
+                if (recorder.state === "recording") recorder.requestData();
             }, 1000);
         };
 
@@ -135,7 +161,6 @@ async function startPublishing() {
     }
 }
 
-// Keep the hack just in case
 function preventBackgroundThrottling() {
     try {
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -145,7 +170,8 @@ function preventBackgroundThrottling() {
         gain.connect(ctx.destination);
         gain.gain.value = 0;
         osc.start();
-    } catch(e) {}
+    } catch (e) {
+    }
 }
 
 // ==========================================
@@ -156,8 +182,11 @@ async function monitorConnection() {
     isWatching = true;
 
     while (isWatching) {
-        try { await startWatching(); }
-        catch (err) { console.error(err); }
+        try {
+            await startWatching();
+        } catch (err) {
+            console.error(err);
+        }
         await new Promise(r => setTimeout(r, 2000));
     }
 }
@@ -169,10 +198,10 @@ async function startWatching() {
     let buffer = "";
 
     while (true) {
-        const { value, done } = await reader.read();
+        const {value, done} = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
+        buffer += decoder.decode(value, {stream: true});
         const lines = buffer.split("\n");
         buffer = lines.pop();
 
@@ -182,7 +211,8 @@ async function startWatching() {
             try {
                 const frame = JSON.parse(trimmed.startsWith("data:") ? trimmed.substring(5) : trimmed);
                 handleIncomingFrame(frame);
-            } catch (e) { }
+            } catch (e) {
+            }
         }
     }
 }
@@ -217,10 +247,13 @@ function processQueue(pId) {
         const nextChunk = queue.shift();
         sb.appendBuffer(nextChunk);
     } catch (e) {
-        // Reset Buffer if full
         if (e.name === 'QuotaExceededError') {
             const video = document.getElementById(`video-${pId}`);
-            try { sb.remove(0, video.currentTime - 1); } catch(ex) {}
+            try {
+                // If buffer full, remove everything older than 1 second ago
+                sb.remove(0, video.currentTime - 1);
+            } catch (ex) {
+            }
         }
     }
 }
@@ -249,16 +282,13 @@ function createVideoTile(pId, isLocal) {
         mediaSources[pId] = ms;
 
         ms.onsourceopen = () => {
-            // GENERIC VP8 ONLY
-            const mime = 'video/webm; codecs=vp8';
+            const mime = CONFIG.codec;
             if (MediaSource.isTypeSupported(mime)) {
                 const sb = ms.addSourceBuffer(mime);
                 sb.mode = 'sequence';
                 mediaBuffers[pId] = sb;
                 sb.addEventListener('updateend', () => processQueue(pId));
                 if (mediaQueues[pId]?.length > 0) processQueue(pId);
-            } else {
-                console.error("Browser rejected VP8");
             }
         };
     }

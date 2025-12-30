@@ -4,7 +4,7 @@
 const CONFIG = {
     chunkInterval: 100,
     watchdogTimeout: 5000,
-    maxLatency: 0.5,
+    maxLatency: 2.0,         // Increased slightly to prevent jitter loops
 };
 
 let streamId = "";
@@ -23,9 +23,10 @@ const stuckMonitors = {};
 const mediaBuffers = {};
 const mediaSources = {};
 const mediaQueues = {};
+const initialSyncMap = {}; // NEW: Track if we have done the initial jump for a user
 
 // ==========================================
-// 2. WATCHDOG & STATS
+// 2. WATCHDOG & STATS (THE FIX IS HERE)
 // ==========================================
 setInterval(() => {
     const now = Date.now();
@@ -39,6 +40,7 @@ setInterval(() => {
     });
 }, 2000);
 
+// Stats Loop - Runs every 500ms
 setInterval(() => {
     const uptime = Math.floor((Date.now() - sessionStartTime) / 1000);
     const uptimeStr = new Date(uptime * 1000).toISOString().substr(11, 8);
@@ -48,33 +50,42 @@ setInterval(() => {
         const statsEl = document.getElementById(`stats-${pId}`);
         if (!video) return;
 
-        // ---------------------------------------------
-        // CASE 1: ME (LOCAL) - CHECK SOCKET STATE
-        // ---------------------------------------------
+        // --- LOCAL USER ---
         if (pId === myPId) {
             if (statsEl) {
                 if (isSocketConnected) {
                     statsEl.innerHTML = `⏱️ ${uptimeStr} (Live)`;
-                    statsEl.style.color = "#0f0"; // Green
+                    statsEl.style.color = "#0f0";
                 } else {
                     statsEl.innerHTML = `⚠️ Reconnecting...`;
-                    statsEl.style.color = "orange"; // Orange/Red
+                    statsEl.style.color = "orange";
                 }
             }
             return;
         }
 
-        // ---------------------------------------------
-        // CASE 2: REMOTE (BUFFERED)
-        // ---------------------------------------------
+        // --- REMOTE USER ---
         const sb = mediaBuffers[pId];
-        if (!sb) return;
+        if (!sb || sb.buffered.length === 0) return;
 
-        let lag = 0;
-        if (sb.buffered.length > 0) {
-            lag = sb.buffered.end(sb.buffered.length - 1) - video.currentTime;
+        // 1. Calculate Lag (Safely)
+        const bufferedEnd = sb.buffered.end(sb.buffered.length - 1);
+        let lag = bufferedEnd - video.currentTime;
+
+        // FIX: Prevent negative lag display (UI Only)
+        if (lag < 0) lag = 0;
+
+        // 2. INITIAL SYNC (Fixes the Glitch/Crash)
+        // We wait until the loop runs to jump, rather than jumping inside the append event.
+        // This ensures the buffer is stable before we seek.
+        if (!initialSyncMap[pId] && sb.buffered.length > 0) {
+            console.log(`🚀 Initial Sync for ${pId}`);
+            video.currentTime = bufferedEnd - 0.1;
+            initialSyncMap[pId] = true; // Mark as synced
+            return;
         }
 
+        // 3. Update UI
         if (statsEl) {
             statsEl.innerHTML = `
                 ⏱️ ${uptimeStr}<br>
@@ -82,14 +93,20 @@ setInterval(() => {
             `;
         }
 
+        // 4. Auto-Jump (Anti-Lag)
         if (lag > CONFIG.maxLatency) {
-            video.currentTime = sb.buffered.end(sb.buffered.length - 1) - 0.1;
+            console.log(`⏩ JUMPING ${pId} (Lag: ${lag.toFixed(2)}s)`);
+            video.currentTime = bufferedEnd - 0.1;
         }
 
+        // 5. Frozen Check (Heartbeat)
         if (video.paused) return;
         const lastTime = stuckMonitors[pId] || 0;
-        if (Math.abs(video.currentTime - lastTime) < 0.05 && sb.buffered.length > 0) {
-            video.currentTime = sb.buffered.end(sb.buffered.length - 1) - 0.1;
+        if (Math.abs(video.currentTime - lastTime) < 0.05) {
+            // Only nudge if we actually have data to play
+            if (sb.buffered.length > 0) {
+                video.currentTime = bufferedEnd - 0.1;
+            }
         }
         stuckMonitors[pId] = video.currentTime;
     });
@@ -104,6 +121,7 @@ function removePresenter(pId) {
     delete mediaSources[pId];
     delete lastPacketTime[pId];
     delete stuckMonitors[pId];
+    delete initialSyncMap[pId];
     updateGridLayout();
 }
 
@@ -119,7 +137,6 @@ function removeAllRemotePresenters() {
 function joinAsWatcher() {
     const roomInput = document.getElementById('streamInput').value;
     const nameInput = document.getElementById('usernameInput').value;
-
     if (!roomInput || !nameInput) return alert("Enter Room and Name");
 
     streamId = roomInput;
@@ -133,7 +150,6 @@ function joinAsWatcher() {
 async function joinAsPresenter() {
     const roomInput = document.getElementById('streamInput').value;
     const nameInput = document.getElementById('usernameInput').value;
-
     if (!roomInput || !nameInput) return alert("Enter Room and Name");
 
     streamId = roomInput;
@@ -182,7 +198,7 @@ async function startPublishing() {
 
         socket.onopen = () => {
             console.log("🎥 PRESENTER: Connected");
-            isSocketConnected = true; // <--- UPDATE STATE
+            isSocketConnected = true;
 
             const options = {videoBitsPerSecond: 1000000};
             const recorder = new MediaRecorder(stream, options);
@@ -204,13 +220,13 @@ async function startPublishing() {
 
         socket.onclose = () => {
             console.warn("⚠️ Socket closed. Retrying in 2s...");
-            isSocketConnected = false; // <--- UPDATE STATE
+            isSocketConnected = false;
             setTimeout(startPublishing, 2000);
         };
 
         socket.onerror = (err) => {
             console.error("❌ Socket Error:", err);
-            isSocketConnected = false; // <--- UPDATE STATE
+            isSocketConnected = false;
             socket.close();
         };
 
@@ -301,7 +317,7 @@ function handleIncomingFrame(frameDTO) {
 }
 
 // ==========================================
-// 6. CODEC
+// 6. CODEC (FIXED: NO IMMEDIATE JUMP)
 // ==========================================
 function setupPlayerBruteForce(pId, firstChunk) {
     const ms = mediaSources[pId];
@@ -329,20 +345,9 @@ function setupPlayerBruteForce(pId, firstChunk) {
     if (sb) {
         sb.mode = 'sequence';
         mediaBuffers[pId] = sb;
-        let isFirstAppend = true;
-        sb.addEventListener('updateend', () => {
-            if (isFirstAppend) {
-                isFirstAppend = false;
-                const video = document.getElementById(`video-${pId}`);
-                try {
-                    if (sb.buffered.length > 0) {
-                        video.currentTime = sb.buffered.end(0) - 0.1;
-                    }
-                } catch (e) {
-                }
-            }
-            processQueue(pId);
-        });
+        // FIX: Removed the "updateend" listener that forced the immediate jump.
+        // We now rely on the "initialSyncMap" in the stats loop to handle the first jump safely.
+        sb.addEventListener('updateend', () => processQueue(pId));
     }
 }
 
@@ -385,9 +390,7 @@ function createVideoTile(pId, isLocal, displayName) {
     card.innerHTML = `
         <div class="video-wrapper">
             <video id="video-${pId}" autoplay playsinline muted></video>
-            
             ${!isLocal ? `<button id="btn-${pId}" class="unmute-btn">🔇 Unmute</button>` : ''}
-            
             <div id="stats-${pId}" class="stats-overlay">
                 Connecting...
             </div>

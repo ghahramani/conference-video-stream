@@ -14,21 +14,18 @@ import java.util.*
 @RestController
 class ConsumerResource(private val service: StreamDispatcherService) {
 
-    @GetMapping("/watch/{streamId}", produces = [MediaType.TEXT_EVENT_STREAM_VALUE])
+    @GetMapping("/watch/{streamId}", produces = [MediaType.APPLICATION_NDJSON_VALUE])
     fun watchStream(
         @PathVariable streamId: String,
-        @RequestParam quality: VideoQuality
+        @RequestParam(defaultValue = "HIGH") quality: VideoQuality
     ): Flux<VideoFrameResponseRestModel> = service
         .retrieveStream(streamId)
         .filter { frame -> frame.quality == quality }
         .onBackpressureDrop()
         .map { frame ->
-            val bytes = ByteArray(frame.data.readableByteCount())
-            frame.data.read(bytes)
-
             VideoFrameResponseRestModel(
                 pId = frame.pId,
-                dataBase64 = Base64.getEncoder().encodeToString(bytes),
+                dataBase64 = Base64.getEncoder().encodeToString(frame.data),
                 quality = frame.quality
             )
         }

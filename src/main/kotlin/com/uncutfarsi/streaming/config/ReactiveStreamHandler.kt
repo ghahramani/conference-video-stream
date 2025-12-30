@@ -13,8 +13,6 @@ import java.util.*
 class ReactiveStreamHandler(private val service: StreamDispatcherService) : WebSocketHandler {
 
     override fun handle(session: WebSocketSession): Mono<Void> {
-        // 1. Parse all 3 required parameters from the URL
-        // Example URL: ws://localhost:8080/publish/{streamId}/{pId}/{quality}
         val streamId = parseStreamId(session)
         val pId = parseParticipantId(session)
         val quality = parseQuality(session)
@@ -23,14 +21,7 @@ class ReactiveStreamHandler(private val service: StreamDispatcherService) : WebS
             .receive()
             .map(WebSocketMessage::getPayload)
             .doOnNext { buffer ->
-                // 2. Dispatch to the service
-                // Note: The service now handles DataBufferUtils.retain(buffer) internally
-                service.dispatch(
-                    streamId = streamId,
-                    pId = pId,
-                    quality = quality,
-                    data = buffer
-                )
+                service.dispatch(streamId, pId, quality, buffer)
             }
             .then()
     }
